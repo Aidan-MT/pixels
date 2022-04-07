@@ -147,7 +147,6 @@ class Behaviour(ABC):
         self._spike_rate_data = [None] * len(self.files)
         self._lfp_data = [None] * len(self.files)
         self._motion_index = [None] * len(self.files)
-        self._motion_tracking = [None] * len(self.files)
         self._load_lag()
 
     def set_cache(self, on: bool | Literal["overwrite"]) -> None:
@@ -356,6 +355,10 @@ class Behaviour(ABC):
             print(
                 f">>>>> Processing spike data for recording {rec_num + 1} of {len(self.files)}"
             )
+            output = self.processed / recording['spike_processed']
+
+            if output.exists():
+                continue
 
             data_file = self.find_file(recording['spike_data'])
             orig_rate = self.spike_meta[rec_num]['imSampRate']
@@ -378,7 +381,6 @@ class Behaviour(ABC):
                 self.sync_data(rec_num, sync_channel=data[:, -1])
             lag_start, lag_end = self._lag[rec_num]
 
-            output = self.processed / recording['spike_processed']
             print(f"> Saving data to {output}")
             if lag_end < 0:
                 data = data[:lag_end]
@@ -579,9 +581,16 @@ class Behaviour(ABC):
         videos = []
 
         for recording in self.files:
-            for video in recording.get('camera_data', []):
+            for v, video in enumerate(recording.get('camera_data', [])):
                 if project in video.stem:
                     avi = self.interim / video.with_suffix('.avi')
+                    if not avi.exists():
+                        meta = recording['camera_meta'][v]
+                        ioutils.tdms_to_video(
+                            self.find_file(video, copy=False),
+                            self.find_file(meta),
+                            avi,
+                        )
                     if not avi.exists():
                         raise PixelsError(f"Path {avi} should exist but doesn't... discuss.")
                     videos.append(avi.as_posix())
@@ -617,7 +626,7 @@ class Behaviour(ABC):
                 aligned = self._align_dlc_coords(rec_num, metadata, coords)
 
                 ioutils.write_hdf5(
-                    self.processed / f"motion_tracking_{rec_num}.h5",
+                    self.processed / f"motion_tracking_{project}_{rec_num}.h5",
                     aligned,
                 )
 
@@ -649,8 +658,8 @@ class Behaviour(ABC):
         timestamps = ioutils.tdms_parse_timestamps(metadata)
         assert len(onsets) == len(timestamps) == len(coords)
 
-        # The last frame gets delayed a bit, so ignoring it, are the timestamp diffs
-        # fixed?
+        # The last frame sometimes gets delayed a bit, so ignoring it, are the timestamp
+        # diffs fixed?
         assert len(np.unique(np.diff(onsets[:-1]))) == 1
 
         if self._lag[rec_num] is None:
@@ -661,22 +670,43 @@ class Behaviour(ABC):
         lag_start, lag_end = self._lag[rec_num]
         no_lag = slice(max(lag_start, 0), -1-max(lag_end, 0))
 
-        xs = np.arange(0, len(trigger))
+        # If this fails, we'll have to understand why and if we need to change this
+        # logic.
+        assert len(coords.columns.get_level_values("scorer").unique()) == 1
         scorer = coords.columns.get_level_values("scorer")[0]
         bodyparts = coords.columns.get_level_values("bodyparts").unique()
-        likelihood_threshold = 0.8
+        xs = np.arange(0, len(trigger))
+        likelihood_threshold = 0.05
         processed = {}
         action_labels = self.get_action_labels()[rec_num]
 
         for label in bodyparts:
             label_coords = coords[scorer][label]
+
+            # Un-invert y coordinates
+            label_coords.y = 480 - label_coords.y
+
+            # Remove unlikely coordinates from fitted B-spline
             bads = label_coords["likelihood"] < likelihood_threshold
-            label_coords["x"][bads] = 0
-            label_coords["y"][bads] = 480
-            tck_x = interpolate.splrep(onsets, label_coords["x"])
-            ynew_x = interpolate.splev(xs, tck_x)
-            tck_y = interpolate.splrep(onsets, label_coords["y"])
-            ynew_y = interpolate.splev(xs, tck_y)
+            good_onsets = onsets[~bads]
+            assert len(good_onsets) == len(onsets) - bads.sum()
+
+            # Interpolate to desired sampling rate
+
+            # B-spline poly fit
+            # spl_x = interpolate.splrep(good_onsets, label_coords.x[~ bads])
+            # ynew_x = interpolate.splev(xs, spl_x)
+            # spl_y = interpolate.splrep(good_onsets, label_coords.y[~ bads])
+            # ynew_y = interpolate.splev(xs, spl_y)
+
+            # Linear fit
+            ynew_x = interpolate.interp1d(
+                good_onsets, label_coords.x[~ bads], fill_value="extrapolate",
+            )(xs)
+            ynew_y = interpolate.interp1d(
+                good_onsets, label_coords.y[~ bads], fill_value="extrapolate",
+            )(xs)
+
             data = np.array([ynew_x[no_lag], ynew_y[no_lag]]).T
             assert action_labels.shape == data.shape
             processed[label] = pd.DataFrame(data, columns=["x", "y"])
@@ -885,6 +915,7 @@ class Behaviour(ABC):
 
         """
         saved = getattr(self, attr)
+
         if saved[0] is None:
             for rec_num, recording in enumerate(self.files):
                 if key in recording:
@@ -920,12 +951,23 @@ class Behaviour(ABC):
         """
         return self._get_processed_data("_motion_index", "motion_index")
 
-    def get_motion_tracking_data(self):
+    def get_motion_tracking_data(self, dlc_project: str):
         """
         Returns the DLC coordinates from self._motion_tracking if they have been loaded
         already, or from file.
         """
-        return self._get_processed_data("_motion_tracking", "motion_tracking")
+        key = f"motion_tracking_{dlc_project}"
+        attr = f"_{key}"
+        if hasattr(self, attr):
+            return getattr(self, attr)
+
+        setattr(self, attr, [None] * len(self.files))
+
+        for rec_num, recording in enumerate(self.files):
+            if "camera_data" in recording:
+                recording[key] = f"{key}_{rec_num}.h5"
+
+        return self._get_processed_data(attr, key)
 
     def get_spike_data(self):
         """
@@ -989,12 +1031,12 @@ class Behaviour(ABC):
         half = int((self.sample_rate * duration) / 2)
         cursor = 0  # In sample points
         i = -1
+        rec_trials = {}
 
         for rec_num in range(len(self.files)):
             actions = action_labels[rec_num][:, 0]
             events = action_labels[rec_num][:, 1]
             trial_starts = np.where(np.bitwise_and(actions, label))[0]
-            rec_trials = {}
 
             # Account for multiple raw data files
             meta = self.spike_meta[rec_num]
@@ -1031,21 +1073,13 @@ class Behaviour(ABC):
                     udf = pd.DataFrame({int(unit): u_times})
                     tdf.append(udf)
 
-                if tdf:
-                    tdfc = pd.concat(tdf, axis=1)
-                    if rate:
-                        tdfc = signal.convolve(tdfc, duration * 1000, sigma)
-                    rec_trials[i] = tdfc
+                assert len(tdf) == len(units)
+                tdfc = pd.concat(tdf, axis=1)
+                if rate:
+                    tdfc = signal.convolve(tdfc, duration * 1000, sigma)
+                rec_trials[i] = tdfc
 
-        if rec_trials:
-            trials = pd.concat(rec_trials, axis=1, names=["trial", "unit"])
-        else:
-            trials = pd.DataFrame(
-                {rec_num: np.nan},
-                index=range(int(duration * 1000)),
-                columns=pd.MultiIndex.from_arrays([[-1], [-1]], names=['trial', 'unit'])
-            )
-
+        trials = pd.concat(rec_trials, axis=1, names=["trial", "unit"])
         trials = trials.reorder_levels(["unit", "trial"], axis=1)
         trials = trials.sort_index(level=0, axis=1)
 
@@ -1192,7 +1226,7 @@ class Behaviour(ABC):
     @_cacheable
     def align_trials(
         self, label, event, data='spike_times', raw=False, duration=1, sigma=None,
-        units=None
+        units=None, dlc_project=None,
     ):
         """
         Get trials aligned to an event. This finds all instances of label in the action
@@ -1227,6 +1261,10 @@ class Behaviour(ABC):
             The output from self.select_units, used to only apply this method to a
             selection of units.
 
+        dlc_project : str | None
+            The DLC project from which to get motion tracking coordinates, if aligning
+            to motion_tracking data.
+
         """
         data = data.lower()
 
@@ -1250,6 +1288,9 @@ class Behaviour(ABC):
                 units=units
             )
 
+        if data == "motion_tracking" and not dlc_project:
+            raise PixelsError("When aligning to 'motion_tracking', dlc_project is needed.")
+
         action_labels = self.get_action_labels()
 
         if raw:
@@ -1261,7 +1302,10 @@ class Behaviour(ABC):
 
         else:
             print(f"Aligning {data} data to trials.")
-            values = getattr(self, f"get_{data}_data")()
+            if dlc_project:
+                values = self.get_motion_tracking_data(dlc_project)
+            else:
+                values = getattr(self, f"get_{data}_data")()
             sample_rate = self.sample_rate
 
         if not values or values[0] is None:
@@ -1274,6 +1318,9 @@ class Behaviour(ABC):
         # index data.
         scan_duration = self.sample_rate * 10
         half = (sample_rate * duration) // 2
+        if isinstance(half, float):
+            assert half.is_integer()  # In case duration is a float < 1
+            half = int(half)
 
         for rec_num in range(len(self.files)):
             if values[rec_num] is None:
