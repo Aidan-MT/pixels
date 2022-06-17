@@ -4,6 +4,7 @@ data and run subsequent analyses.
 """
 
 
+from operator import attrgetter, itemgetter
 from pathlib import Path
 
 import pandas as pd
@@ -32,13 +33,23 @@ class Experiment:
     meta_dir : str
         Path to the folder containing training metadata JSON files.
 
+    interim_dir : str
+        Path to the folder to use for interim files. If not passed, this will default to
+        a folder inside the data_dir called 'interim'.
+
     session_date_fmt : str
         A format string used to parse the date from the name of session folders. By
         default this is "%y%m%d" which will capture YYMMDD formats.
 
     """
     def __init__(
-        self, mouse_ids, behaviour, data_dir, meta_dir=None, session_date_fmt="%y%m%d",
+        self,
+        mouse_ids,
+        behaviour,
+        data_dir,
+        meta_dir=None,
+        interim_dir=None,
+        session_date_fmt="%y%m%d",
     ):
         if not isinstance(mouse_ids, (list, tuple, set)):
             mouse_ids = [mouse_ids]
@@ -57,10 +68,6 @@ class Experiment:
         else:
             self.meta_dir = None
 
-        self.raw = self.data_dir / 'raw'
-        self.processed = self.data_dir / 'processed'
-        self.interim = self.data_dir / 'interim'
-
         self.sessions = []
         sessions = ioutils.get_sessions(mouse_ids, self.data_dir, self.meta_dir, session_date_fmt)
 
@@ -71,8 +78,11 @@ class Experiment:
                     name,
                     metadata=[s['metadata'] for s in metadata],
                     data_dir=metadata[0]['data_dir'],
+                    interim_dir=interim_dir,
                 )
             )
+
+        self.sessions.sort(key=attrgetter("name"))
 
     def __getitem__(self, index):
         """
@@ -167,32 +177,27 @@ class Experiment:
                    .format(session.name, i + 1, len(self.sessions)))
             session.run_motion_tracking(*args, **kwargs)
 
-    def draw_motion_index_rois(self, num_rois=1):
+    def draw_motion_index_rois(self, video_match, num_rois=1, skip=True):
         """
-        Draw motion index ROIs using EasyROI. If ROIs already exist, skip.
-
-        Parameters
-        ----------
-        num_rois : int
-            The number of ROIs to draw interactively. Default: 1
-
+        Draw motion index ROIs using EasyROI. If ROIs already exist, skip, unless skip
+        is False.
         """
         for i, session in enumerate(self.sessions):
             print(">>>>> Drawing motion index ROIs for session {} ({} / {})"
                    .format(session.name, i + 1, len(self.sessions)))
-            session.draw_motion_index_rois(num_rois=num_rois)
+            session.draw_motion_index_rois(video_match, num_rois=num_rois, skip=skip)
 
-    def process_motion_index(self, num_rois=1):
+    def process_motion_index(self, video_match, num_rois=1, skip=True):
         """
         Extract motion indexes from videos for all sessions.
         """
         for session in self.sessions:
-            session.draw_motion_index_rois(num_rois=num_rois)
+            session.draw_motion_index_rois(video_match, num_rois=num_rois, skip=skip)
 
         for i, session in enumerate(self.sessions):
             print(">>>>> Processing motion index for session {} ({} / {})"
                    .format(session.name, i + 1, len(self.sessions)))
-            session.process_motion_index()
+            session.process_motion_index(video_match)
 
     def select_units(self, *args, **kwargs):
         """
@@ -201,7 +206,7 @@ class Experiment:
         """
         units = []
 
-        for session in self.sessions:
+        for i, session in enumerate(self.sessions):
             units.append(session.select_units(*args, **kwargs))
 
         return units
@@ -211,27 +216,36 @@ class Experiment:
         Get trials aligned to an event. Check behaviours.base.Behaviour.align_trials for
         usage information.
         """
-        trials = []
+        trials = {}
         for i, session in enumerate(self.sessions):
             if units:
-                trials.append(session.align_trials(*args, units=units[i], **kwargs))
+                if units[i]:
+                    trials[i] = session.align_trials(*args, units=units[i], **kwargs)
             else:
-                trials.append(session.align_trials(*args, **kwargs))
+                trials[i] = session.align_trials(*args, **kwargs)
 
         if "motion_tracking" in args:
             df = pd.concat(
-                trials, axis=1, copy=False,
-                keys=range(len(trials)),
+                trials.values(), axis=1, copy=False,
+                keys=trials.keys(),
                 names=["session", "trial", "scorer", "bodyparts", "coords"]
             )
 
         else:
             df = pd.concat(
-                trials, axis=1, copy=False,
-                keys=range(len(trials)),
-                names=["session", "unit", "trial"]
+                trials.values(), axis=1, copy=False,
+                keys=trials.keys(),
+                names=["session"] + trials[0].columns.names,
             )
 
+        return df
+
+    def align_clips(self, label, event, video_match, duration=1):
+        trials = []
+        for session in self.sessions:
+            trials.append(session.align_clips(label, event, video_match, duration))
+
+        df = pd.concat(trials, axis=1, copy=False, names=["Session"], keys=range(len(trials)))
         return df
 
     def get_cluster_info(self):
@@ -245,18 +259,18 @@ class Experiment:
         """
         Get the widths of spikes for units matching the specified criteria.
         """
-        widths = []
+        widths = {}
 
         for i, session in enumerate(self.sessions):
             if units:
-                ses_widths = session.get_spike_widths(units=units[i])
+                if units[i]:
+                    widths[i] = session.get_spike_widths(units=units[i])
             else:
-                ses_widths = session.get_spike_widths()
-            widths.append(ses_widths)
+                widths[i] = session.get_spike_widths()
 
         df = pd.concat(
-            widths, axis=1, copy=False,
-            keys=range(len(widths)),
+            widths.values(), axis=1, copy=False,
+            keys=widths.keys(),
             names=["session"]
         )
         return df
@@ -265,18 +279,18 @@ class Experiment:
         """
         Get the waveforms of spikes for units matching the specified criteria.
         """
-        waveforms = []
+        waveforms = {}
 
         for i, session in enumerate(self.sessions):
             if units:
-                ses_wfs = session.get_spike_waveforms(units=units[i])
+                if units[i]:
+                    waveforms[i] = session.get_spike_waveforms(units=units[i])
             else:
-                ses_wfs = session.get_spike_waveforms()
-            waveforms.append(ses_wfs)
+                waveforms[i] = session.get_spike_waveforms()
 
         df = pd.concat(
-            waveforms, axis=1, copy=False,
-            keys=range(len(waveforms)),
+            waveforms.values(), axis=1, copy=False,
+            keys=waveforms.keys(),
             names=["session"]
         )
         return df
